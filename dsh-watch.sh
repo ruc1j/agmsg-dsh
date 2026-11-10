@@ -28,10 +28,71 @@ PROJECT="${1:?Usage: dsh-watch.sh <project_path> [session_id]}"
 SESSION="${DSH_SESSION_ID:-${2:-}}"
 PARENT_PID="$PPID"
 POLL_TIMEOUT="${AGMSG_DSH_POLL_TIMEOUT:-20}"
+AGMSG_PLATFORM="$(uname -s 2>/dev/null || true)"
+
+# Windows: Git Bash's ps cannot see the native parent, so resolve the spawning
+# pwsh process once through Windows and poll it with tasklist. dsh cancels the
+# job's pwsh when the session is disposed, but a bash grandchild can survive
+# that kill (observed with a profile reload), so this check is not optional.
+WIN_PARENT=""
+case "$AGMSG_PLATFORM" in
+  MINGW*|MSYS*|CYGWIN*)
+    _self_winpid="$(cat "/proc/$$/winpid" 2>/dev/null || true)"
+    case "$_self_winpid" in
+      ''|*[!0-9]*) ;;
+      *)
+        # Git's bin/bash.exe is a wrapper that re-executes usr/bin/bash.exe, so
+        # the immediate native parent is another bash. Walk past the bash/shell
+        # layer and monitor the first real host (dsh's pwsh job process). When
+        # that ancestor has already died, print the last parent we saw: it is
+        # gone, and the poll below exits the watcher.
+        WIN_PARENT="$(
+          AGMSG_SELF_WINPID="$_self_winpid" powershell.exe -NoProfile -Command '
+            $id = $env:AGMSG_SELF_WINPID
+            $last = $id
+            for ($i = 0; $i -lt 10 -and $id; $i++) {
+              $p = Get-CimInstance Win32_Process -Filter "ProcessId=$id"
+              if (-not $p) { break }
+              if ($p.Name -notmatch "^(bash|sh|dash|git)\.exe$") {
+                [Console]::Out.Write($p.ProcessId); exit 0
+              }
+              $last = $p.ParentProcessId
+              $id = $p.ParentProcessId
+            }
+            [Console]::Out.Write($last)
+          ' 2>/dev/null | tr -d '\r' || true
+        )"
+        ;;
+    esac
+    case "$WIN_PARENT" in ''|*[!0-9]*) WIN_PARENT="" ;; esac
+    unset _self_winpid
+    ;;
+esac
 
 parent_alive() {
+  case "$AGMSG_PLATFORM" in
+    MINGW*|MSYS*|CYGWIN*)
+      if [ -n "$WIN_PARENT" ]; then
+        tasklist //FI "PID eq $WIN_PARENT" //NH 2>/dev/null \
+          | awk -v p="$WIN_PARENT" '$2 == p { found = 1 } END { exit !found }'
+        return $?
+      fi
+      return 0
+      ;;
+  esac
   [ "$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')" = "$PARENT_PID" ] \
     && kill -0 "$PARENT_PID" 2>/dev/null
+}
+
+# A pidfile pid is ours when it is alive and (where ps can answer) its argv is
+# this script. Git Bash's ps has no -o, so otherwise the live pid is trusted.
+watcher_pid_is_ours() {
+  local pid="$1" out
+  kill -0 "$pid" 2>/dev/null || return 1
+  if out="$(ps -o command= -p "$pid" 2>/dev/null)" && [ -n "$out" ]; then
+    printf '%s' "$out" | grep -q 'dsh-watch\.sh' || return 1
+  fi
+  return 0
 }
 
 PLUGIN_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -52,8 +113,7 @@ mkdir -p "$RUN_DIR"
 
 if [ -f "$PIDFILE" ]; then
   old="$(cat "$PIDFILE" 2>/dev/null || true)"
-  if [ -n "$old" ] && [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null \
-     && ps -o command= -p "$old" 2>/dev/null | grep -q 'dsh-watch\.sh'; then
+  if [ -n "$old" ] && [ "$old" != "$$" ] && watcher_pid_is_ours "$old"; then
     echo "agmsg watch: already running for this session (pid $old) - nothing to do, do not start another"
     exit 0
   fi
@@ -88,5 +148,22 @@ while IFS=$'\t' read -r team agent; do
   "$SCRIPTS/inbox.sh" "$team" "$agent" --quiet || true
 done <<< "$PAIRS"
 
-printf '\nagmsg watch: delivered - handle the messages above (reply with send.sh), then re-arm the watcher:\n  %q %q   (bash, run_in_background: true)\n' \
-  "$PLUGIN_DIR/dsh-watch.sh" "$PROJECT"
+case "$AGMSG_PLATFORM" in
+  MINGW*|MSYS*|CYGWIN*)
+    BASH_WIN="/c/Program Files/Git/bin/bash.exe"
+    if [ ! -x "$BASH_WIN" ]; then
+      BASH_WIN="$(command -v bash 2>/dev/null || printf 'bash')"
+      case "$BASH_WIN" in
+        */usr/bin/bash) BASH_WIN="${BASH_WIN%/usr/bin/bash}/bin/bash" ;;
+        */mingw64/bin/bash) BASH_WIN="${BASH_WIN%/mingw64/bin/bash}/bin/bash" ;;
+      esac
+    fi
+    BASH_WIN="$(cygpath -w "$BASH_WIN" 2>/dev/null || printf '%s' "$BASH_WIN")"
+    printf '\nagmsg watch: delivered - handle the messages above (reply with send.sh), then re-arm the watcher:\n  & %s %s %s   (pwsh, run_in_background: true)\n' \
+      "'$BASH_WIN'" "'$(cygpath -w "$PLUGIN_DIR/dsh-watch.sh")'" "'$(cygpath -w "$PROJECT")'"
+    ;;
+  *)
+    printf '\nagmsg watch: delivered - handle the messages above (reply with send.sh), then re-arm the watcher:\n  %q %q   (bash, run_in_background: true)\n' \
+      "$PLUGIN_DIR/dsh-watch.sh" "$PROJECT"
+    ;;
+esac
